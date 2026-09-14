@@ -1,0 +1,36 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    env:
+      # 仓库里 rust-toolchain.toml 固定了 gnu 工具链（本机无 MSVC 链接器），
+      # CI 的 windows runner 自带 MSVC Build Tools，这里强制回 msvc。
+      RUSTUP_TOOLCHAIN: stable-x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable-x86_64-pc-windows-msvc
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # 冒烟：调试构建（不打包 NSIS），验证代码可编译可链接；
+      # 前端是静态 dist/，无需 node/pnpm。
+      - name: Build (debug, no bundle)
+        run: cargo build --manifest-path src-tauri/Cargo.toml --bin kimi-web-tauri
+
+      - name: Smoke check
+        shell: pwsh
+        run: |
+          $exe = "src-tauri/target/debug/kimi-web-tauri.exe"
+          if (-not (Test-Path $exe)) { throw "smoke check failed: $exe missing" }
+          Write-Host "smoke check passed: $exe built"

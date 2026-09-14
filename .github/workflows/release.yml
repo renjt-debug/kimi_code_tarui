@@ -1,0 +1,64 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    env:
+      # 仓库里 rust-toolchain.toml 固定了 gnu 工具链（本机无 MSVC 链接器）。
+      # CI 的 windows runner 自带 MSVC Build Tools，这里强制回 msvc：
+      # 构建更快，且 WebView2Loader 静态并入 exe（部署单文件即可）。
+      RUSTUP_TOOLCHAIN: stable-x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable-x86_64-pc-windows-msvc
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend deps
+        run: pnpm install --frozen-lockfile
+
+      - name: Build (NSIS installer + portable exe)
+        run: pnpm tauri build
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kimi-web-tauri-windows
+          if-no-files-found: error
+          path: |
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/kimi-web-tauri.exe
+
+      - name: Create draft release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+          # 下载说明置于正文顶部，自动生成的更新日志会追加其后
+          body_path: .github/release-body.md
+          files: |
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/kimi-web-tauri.exe

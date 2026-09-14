@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "本地页面（加载页/错误页）的 IPC：事件收发",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

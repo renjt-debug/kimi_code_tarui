@@ -1,0 +1,5 @@
+# windows-gnu 下 ld/lld 默认自动导出全部符号（10 万+），超过 PE 格式
+# 单 DLL 65535 个导出符号的上限，cdylib 链接报 export ordinal too large。
+# 桌面版 exe 静态链接 rlib、不按符号加载 dll，排除导出无副作用。
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "link-arg=-Wl,--exclude-all-symbols"]

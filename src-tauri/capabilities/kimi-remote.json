@@ -1,0 +1,10 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "kimi-remote",
+  "description": "kimi web 远程页面（127.0.0.1 动态端口）：仅允许发送事件（标题栏取色、失败重试）",
+  "windows": ["main"],
+  "remote": {
+    "urls": ["http://127.0.0.1:*", "http://localhost:*"]
+  },
+  "permissions": ["core:event:allow-emit"]
+}
