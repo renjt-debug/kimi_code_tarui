@@ -1,6 +1,6 @@
 [package]
 name = "kimi-web-tauri"
-version = "0.1.0"
+version = "0.1.1"
 description = "Tauri desktop launcher for the Kimi Code web UI"
 authors = ["Ren.Jinting (任晋廷)"]
 edition = "2021"
