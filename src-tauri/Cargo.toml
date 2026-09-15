@@ -27,4 +27,11 @@ windows-sys = { version = "0.59", features = [
   "Win32_System_JobObjects",
   "Win32_System_Registry",
   "Win32_System_Threading",
+  "Win32_UI_WindowsAndMessaging",
+] }
+# 与依赖树中既有版本保持一致（wry/webview2 侧已在用 0.61.x）
+windows = { version = "0.61", features = [
+  "Data_Xml_Dom",
+  "UI_Notifications",
+  "Win32_System_Com",
 ] }

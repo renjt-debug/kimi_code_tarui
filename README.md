@@ -18,6 +18,111 @@
 其余逻辑完全一致：Job Object 崩溃兜底、启动前清理残留、端口占用自动清理重试、
 单实例、标题栏颜色跟随页面、错误页内嵌重试按钮。
 
+## 桌面通知（失焦提醒）
+
+WebView2 宿主默认不授浏览器通知权限，本封装用**初始化脚本把页面的
+Notification API 打补丁**接通：`Notification.permission` 恒为 granted，
+`new Notification(...)` 时在页面内弹吐司并把内容转发给宿主——窗口**失焦**时
+闪任务栏 + Windows 系统 toast（kimi 自带"失焦才通知"逻辑，聚焦时只有页面内
+吐司）。通知调用记录在 `%TEMP%\kimi-web-tauri-notify.log` 便于排障。
+
+已知取舍：非打包桌面应用没有自己的 AppUserModelID，系统 toast 借用
+PowerShell 的 AUMID 显示，通知归属会写成 Windows PowerShell（仅观感问题）。
+
+## Token/秒（TPS）实时浮层
+
+kimi web 前端**不显示吞吐**（实测其 `/assets/index-*.js` 里 `TPS`、`TTFT`、
+`tok/s`、`streamDuration` 出现次数均为 0；服务端其实把数据都发过来了，只有
+TUI 里用了）。本封装用第二段初始化脚本（[src/tps.js](src-tauri/src/tps.js)）
+在页面构建前 hook `/api/v1/ws` 的 WebSocket，把这块补上。
+
+**真实线格式**（从运行中的 v0.42.0 抓包确认，别照直觉猜）：页面**收不到**
+`assistant.delta` / `thinking.delta`（那是服务端内部事件名），流式增量全走
+`transcript.ops` 帧——`payload.agent_id === "main"` 且 `payload.ops[]` 里：
+
+```json
+{"op":"frame.upsert","frame":{"kind":"thinking|text","frameId":"t2.1.f1","text":""}}
+{"op":"append","target":{"type":"frame","frameId":"t2.1.f1"},"offset":0,"text":"增量文本"}
+{"op":"step.upsert","step":{"stepId":"t2.1","state":"completed",
+  "usage":{"inputOther":160,"output":22,"inputCacheRead":20224,"inputCacheCreation":0},
+  "timing":{"llmFirstTokenLatencyMs":22390,"llmStreamDurationMs":823,
+            "llmServerDecodeMs":822,"llmServerFirstTokenMs":22384,"llmClientBlockedMs":27}}}
+{"op":"meta.merge","meta":{"agent":{"phase":{"kind":"streaming","stream":"thinking"}}}}
+{"op":"meta.merge","meta":{"agent":{"usage":{"currentTurn":{"output":22}}}}}
+```
+
+（子 agent 的 ops 通过 `agent_id` 区分，不计入。只统计当前订阅会话的
+`session_id`；页面切换会话时清空统计状态，旧会话的迟到事件不会修改当前结果。）
+
+- **实时估算**：`append` op 的 `text` 逐条计入 3 秒**滚动窗口**。首帧只作计时
+  基准；窗口从「首帧时刻与当前时刻减 3 秒的较大值」开始，到当前时刻结束，
+  仅累计这个左开右闭区间内的增量，再除以相同时长。停顿会降低实时速率。
+  首帧 token 仍计入整步校准。`append` 的
+  target 只带 `frameId`，靠 `frame.upsert` 记下的 `frameId→kind` 映射区分
+  推理/正文。token 数用字符启发式估算：CJK 每字 1，ASCII 字母、数字和下划线
+  每字符 1/4，其它非空白字符 1，空白不计；ASCII 整词和拆帧后的估算量一致。
+- **自校准**：`step.upsert.completed` 带回真实 `step.usage.output`，脚本拿它和
+  本步原始估算量比一下，按各类原始估算量的占比，将「推理 / 正文」系数向这个
+  比值更新。相同样本会收敛，不再重复乘上修正比例。仅完整观测的步骤参与校准，
+  结果存进 `localStorage['kimi.tps.cal.v2']`；旧公式的系数不再沿用。
+- **权威定稿**：同一条 op 还带 `step.timing.*`，于是能显示和 TUI 同口径的真实
+  TPS（`usage.output ÷ llmStreamDurationMs`）、TTFT（优先用服务端自报的
+  `llmFirstTokenLatencyMs`，标注 `(服务端)`；没有时退回「提示词提交 → 首个增量」
+  的 `(端到端)`）以及服务端解码耗时。流太短（<200ms）时不报速率，只亮出真实
+  用量——与 TUI 的 `MIN_STREAM_MS_FOR_TPS` 同义。
+- **显示时机**（吃过亏，别改回去）：`step.upsert(running)` 一出现就亮浮层并显示
+  「生成中… / 首 token Ns」——TTFT 实测能到 17 秒，这段等待期不显示用户就等于
+  看不到；定稿值停留 60 秒（蓝=实时估算，绿=定稿）。等首 token 期间没有增量事件
+  驱动重绘，靠 watchdog 每秒刷新一次，不做逐帧空转。
+- **自检**：[src/tps.test.cjs](src-tauri/src/tps.test.cjs) 用 `vm` 造了假浏览器 +
+  假 WebSocket（定时器与 rAF 两条独立队列，如实模拟"一帧一回调"），其中第 7 组
+  把上面这些真实帧逐字回放并断言浮层文本：
+  另有重复校准、分帧一致性、窗口边界、停顿、会话切换和新轮用量重置回归。
+  `node src-tauri/src/tps.test.cjs`（离线可跑，不需要 kimi/网络；
+  扩展名是 `.cjs`——根 `package.json` 声明了 `"type": "module"`）。
+
+交互：**Ctrl+Alt+T** 显隐，**拖拽**移动，**双击**复位（位置/显隐都记在
+`localStorage`）。控制台可用 `__kimiTps.state()` / `__kimiTps.calibration`
+查看当前窗口与校准系数，`__kimiTps.resetCalibration()` 归零重学。
+
+注意：实时值仍是启发式估算，不能保证与实际分词结果相差几个百分点。
+`usage.output` 是本步输出的合计，不能单独确定推理和正文各自的真实 token 数；
+语言、内容和输出类型变化都可能使校准失准。精确用量应以服务端定稿为准。
+可在控制台改 `__kimiTps.config.windowMs`（窗口越长越稳，但变化响应越慢）。
+
+### 浮层不出现怎么查
+
+脚本内置一条自诊断通道（`DEBUG = true`，见 `tps.js` 顶部）：把「初始化脚本是否
+执行、页面里 DOM 长什么样、WebSocket 有没有 hook 上、**每帧的真实形态**（类型、
+顶层键、payload 键、前 220 字节）与解析结果、以及各计数」经 Tauri 事件
+`kimi-tps-debug` 交给宿主，宿主追加写入 **`%TEMP%\kimi-web-tauri-tps.log`**
+（每次启动清空）。对照着看：
+
+| 日志现象 | 说明 |
+|---|---|
+| 没有 `boot` 行 | 初始化脚本压根没进页面（`initialization_script` 那条路的问题） |
+| `boot` 里 `hasApp:false` / `bodyReady:false` | DOM 还没起来，属正常早期状态 |
+| `boot` 里 `wsPatched:false` | `window.WebSocket` 没被改掉，hook 失效 |
+| `boot` 里 `wsResourceSeen` 非 null | 页面的 socket 在本脚本执行**之前**就建好了，hook 漏了 |
+| `boot` 之后完全没有 `ws.attach` | 页面这版前端没走 `/api/v1/ws`（协议变了） |
+| `ws.attach` 有、`ws.frame` 只有 `ping`/`ack` | 页面没订阅那个会话，服务端不会推它的流（换个会话发消息再看） |
+| `ws.frame` 里 `type` 不是 `transcript.ops` | 线格式变了，照 `head` 字段改 `applyTranscriptOps` |
+| `delta` 一直不出现但 `ws.frame` 有 `transcript.ops` | op 名/字段变了，看 `head` 里的 `ops[].op` |
+| `step.completed` 的 `output` 为 null | `usage` 字段名变了，看日志里的 `usageKeys` |
+| 心跳里 `snap.exists:true` 但 `computedDisplay:"none"` | 空闲态，正常；发消息时再看 |
+| 心跳里 `rect.w` 为 0 / `inViewport:false` | 浮层被页面 CSS 影响了（或不在视口内） |
+
+`heartbeat` 每 15 秒记一次浮层的**真实几何与文本**——"胶囊到底在不在屏幕上"
+不必靠推断，直接看 `snap.text` / `snap.sub` / `snap.rect` 即可（本次排障就是靠它
+发现"数字全对但显示成 none"的）。
+
+控制台还留了这些入口：`__kimiTps.show()` 在没有任何 token 事件时也强制亮出胶囊
+（显示「TPS 就绪」），用来区分「脚本没跑」和「跑了但没数据」；`__kimiTps.snapshot()`
+返回浮层的实际 `display/visibility/opacity/zIndex/rect`；`__kimiTps.dump()` 给出
+最近 160 条本机诊断；`__kimiTps.renderTrace()` 给出最近 40 次渲染的
+`now / t0 / 计算出的等待时长`。参考完成后把 `tps.js` 顶部的 `DEBUG` 改 `false`
+即可完全静音（诊断本身绝不在渲染热路径上打日志——那会与 dbg 的自排定时器互相喂饭）。
+
 环境变量 `KIMI_GUI_BIN` 可覆盖 kimi.exe 路径。
 
 ## 构建

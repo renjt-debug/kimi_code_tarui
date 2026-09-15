@@ -23,6 +23,10 @@ jobs:
         with:
           workspaces: src-tauri
 
+      # 注入脚本（src/tps.js）的离屏验收：假浏览器 + 假 WebSocket，无需 kimi/网络
+      - name: TPS 注入脚本自检
+        run: node src-tauri/src/tps.test.cjs
+
       # 冒烟：调试构建（不打包 NSIS），验证代码可编译可链接；
       # 前端是静态 dist/，无需 node/pnpm。
       - name: Build (debug, no bundle)

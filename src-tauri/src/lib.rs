@@ -3,11 +3,18 @@
 //!    `kimi web --port <N> --no-open`（默认 0 = 自动选空闲端口）；
 //! 2. 从输出横幅解析 `Local: http://127.0.0.1:<port>/#token=<令牌>`，加载进窗口；
 //! 3. 生命周期绑定：关窗停服务、Job Object 崩溃兜底、启动前清理残留、
-//!    端口占用自动清理重试、单实例、标题栏颜色跟随页面。
+//!    端口占用自动清理重试、单实例、标题栏颜色跟随页面；
+//! 4. 桌面通知：WebView2 宿主默认不授浏览器通知权限，用初始化脚本把页面
+//!    的 Notification API 打补丁——页面内弹吐司并把内容转发给宿主，窗口
+//!    失焦时闪任务栏 + Windows 系统 toast（kimi 自带"失焦才通知"逻辑）；
+//! 5. 吞吐浮层：kimi web 前端不显示 token/秒，用初始化脚本 hook 页面的
+//!    WebSocket（/api/v1/ws），从 delta 事件流里估算实时 TPS，并用
+//!    turn.step.completed 的真实 usage 做定稿与自校准（详见 src/tps.js）。
 
 mod dwm;
 mod finder;
 mod host;
+mod notify;
 mod procs;
 mod settings;
 
@@ -49,6 +56,84 @@ const COLOR_SCRIPT: &str = r#"
 })();
 "#;
 
+/// Notification API 补丁（初始化脚本，先于页面脚本在每个页面执行）：
+/// 宿主 WebView2 默认拒授通知权限，这里把 Notification 替换成自有实现——
+/// permission 恒为 granted，构造时在页面内弹吐司并把内容经事件转发给宿主。
+const NOTIFY_POLYFILL: &str = r#"
+(function () {
+  if (typeof window.Notification === 'undefined' || window.__kimiNotifyPatched) return;
+  window.__kimiNotifyPatched = true;
+  function emit(title, body) {
+    try {
+      if (window.__TAURI__ && window.__TAURI__.event) {
+        window.__TAURI__.event.emit('kimi-desktop-notify', { title: String(title || ''), body: String(body || '') });
+      }
+    } catch (e) {}
+  }
+  function toastUi(title, body) {
+    try {
+      var card = document.createElement('div');
+      card.style.cssText = 'position:fixed;top:16px;right:16px;z-index:2147483647;max-width:320px;'
+        + 'padding:12px 14px;border-radius:10px;background:#161a24;color:#e6e8ee;'
+        + 'font:13px/1.5 "Segoe UI","Microsoft YaHei",sans-serif;'
+        + 'box-shadow:0 8px 24px rgba(0,0,0,.45);cursor:pointer;opacity:0;transition:opacity .2s;';
+      var t = document.createElement('div');
+      t.style.cssText = 'font-weight:600;margin-bottom:2px;';
+      t.textContent = String(title || '');
+      var b = document.createElement('div');
+      b.style.cssText = 'color:#9aa1ad;overflow:hidden;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;';
+      b.textContent = String(body || '');
+      card.appendChild(t);
+      card.appendChild(b);
+      card.onclick = function () {
+        try { window.focus(); } catch (e) {}
+        if (card.parentNode) card.parentNode.removeChild(card);
+      };
+      (document.body || document.documentElement).appendChild(card);
+      requestAnimationFrame(function () { card.style.opacity = '1'; });
+      setTimeout(function () { if (card.parentNode) card.parentNode.removeChild(card); }, 6000);
+      return card;
+    } catch (e) { return null; }
+  }
+  function Polyfill(title, options) {
+    options = options || {};
+    this.title = String(title || '');
+    this.body = String(options.body || '');
+    this.tag = options.tag || '';
+    this._card = toastUi(this.title, this.body);
+    emit(this.title, this.body);
+  }
+  Polyfill.prototype.close = function () {
+    if (this._card && this._card.parentNode) this._card.parentNode.removeChild(this._card);
+  };
+  Polyfill.prototype.addEventListener = function () {};
+  Polyfill.prototype.removeEventListener = function () {};
+  Polyfill.prototype.dispatchEvent = function () { return false; };
+  Object.defineProperty(Polyfill, 'permission', {
+    configurable: true,
+    get: function () { return 'granted'; }
+  });
+  Polyfill.requestPermission = function (cb) {
+    var r = 'granted';
+    if (typeof cb === 'function') cb(r);
+    return Promise.resolve(r);
+  };
+  Polyfill.maxActions = 0;
+  window.Notification = Polyfill;
+})();
+"#;
+
+/// Token/秒 实时浮层（初始化脚本，先于页面脚本执行）：hook WebSocket 统计
+/// delta 流估算实时 TPS，并用 turn.step.completed 的真实 usage 定稿 + 自校准。
+/// Ctrl+Alt+T 显隐、拖拽移动、双击复位。实现见 src/tps.js。
+const TPS_SCRIPT: &str = include_str!("tps.js");
+
+/// 注入页面的全部初始化脚本（按顺序拼接后交给 initialization_script）。
+/// `include_str!` 自带变更追踪，改 tps.js / 通知补丁后 cargo 会自动重编。
+fn init_scripts() -> String {
+    format!("{NOTIFY_POLYFILL}\n{TPS_SCRIPT}")
+}
+
 #[derive(Default)]
 struct GuiState {
     host: Mutex<Option<host::HostHandle>>,
@@ -72,6 +157,7 @@ pub fn run() {
                 .inner_size(1280.0, 840.0)
                 .resizable(true)
                 .center()
+                .initialization_script(init_scripts())
                 .on_page_load(|w, payload| on_page_load(w, payload))
                 .build()?;
             apply_default_titlebar(&window);
@@ -96,6 +182,58 @@ pub fn run() {
                 if let Some(w) = color_app.get_webview_window("main") {
                     if let Ok(h) = w.hwnd() {
                         dwm::apply(h.0 as isize, bg, fg);
+                    }
+                }
+            });
+
+            // 桌面通知：页面补丁转发的 Notification 内容 → 失焦时闪任务栏 + 系统 toast
+            let notify_app = app.handle().clone();
+            app.listen("kimi-desktop-notify", move |event| {
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(event.payload()) else {
+                    return;
+                };
+                let title = v["title"].as_str().unwrap_or("Kimi Code");
+                let body = v["body"].as_str().unwrap_or("");
+                if let Some(w) = notify_app.get_webview_window("main") {
+                    // 聚焦时页面内吐司已足够，系统级提醒只在失焦时打扰
+                    if !w.is_focused().unwrap_or(true) {
+                        if let Ok(h) = w.hwnd() {
+                            notify::attention(h.0 as isize, title, body);
+                        }
+                    }
+                }
+            });
+
+            // TPS 浮层的自诊断：页面把「脚本是否执行 / 有没有 hook 到 WS / 每帧真实
+            // 形态与解析结果」批量发上来，这里追加写入 %TEMP%\kimi-web-tauri-tps.log。
+            // 浮层不出现时先看这个文件，别猜。
+            // 启动即清空，保证日志只对应当前这一次运行。
+            if let Some(path) = tps_log_path() {
+                let _ = std::fs::write(&path, b"# kimi-web-tauri TPS diagnostics\n");
+            }
+            app.listen("kimi-tps-debug", move |event| {
+                let Some(path) = tps_log_path() else { return };
+                let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                else {
+                    return;
+                };
+                use std::io::Write;
+                let payload = event.payload();
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) {
+                    let counts = v.get("counts").cloned().unwrap_or(serde_json::Value::Null);
+                    let lines = v
+                        .get("lines")
+                        .and_then(|l| l.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                    for line in lines {
+                        let _ = writeln!(f, "{line}");
+                    }
+                    if !counts.is_null() {
+                        let _ = writeln!(f, "{{\"tag\":\"counts\",\"d\":{counts}}}");
                     }
                 }
             });
@@ -132,6 +270,13 @@ fn apply_default_titlebar(w: &WebviewWindow) {
     if let Ok(h) = w.hwnd() {
         dwm::apply(h.0 as isize, DEFAULT_BG, DEFAULT_FG);
     }
+}
+
+/// TPS 自诊断日志路径（%TEMP%\kimi-web-tauri-tps.log）。
+fn tps_log_path() -> Option<std::path::PathBuf> {
+    std::env::temp_dir().into_os_string().into_string().ok().map(|t| {
+        std::path::Path::new(&t).join("kimi-web-tauri-tps.log")
+    })
 }
 
 fn start_host(app: &tauri::AppHandle, auto: bool) {
