@@ -12,9 +12,17 @@
  *   1. 包装 WebSocket，只拦截 /api/v1/ws 上的下行帧（二进制 ArrayBuffer 或文本），
  *      原样转发给页面，绝不改写数据；
  *   2. 用「每 3 秒滚动窗口」算实时速率：同一时间区间内的估算 token ÷ 时长，
- *      首帧只作计时基准，完成事件到达后切换成真实 output ÷ llmStreamDurationMs；
+ *      首帧只作计时基准（它的 token 不进分子）；完成事件到达后切换成权威口径；
  *   3. token 估算 = 字符启发式 × 自校准系数：每次 step 结束时拿真实 usage.output
  *      和本次原始估算量比一下，存进 localStorage；仍是启发式估算，不保证误差。
+ *
+ * 两个口径（与 ZCode 侧实时 TPS 胶囊保持一致，悬停可见公式）：
+ *   - 模型生成速度 = 本次调用真实 output ÷ 生成阶段时长。分母排除这次调用的
+ *     首 token 等待，但保留同一次生成内部的停顿；不含工具执行时间。
+ *     服务端 llmStreamDurationMs 与「客户端首帧→末帧」取较小者，宁可偏低不虚高。
+ *   - 整轮完成效率 = 整轮各次调用真实 output 之和 ÷ 整轮墙钟，含每次调用的首
+ *     token 等待与工具执行。短于 minGenMs 的生成阶段不报速率，其 token 也不
+ *     计入整轮累计（分子分母同进同出）。
  *
  * 开关：Ctrl+Alt+T 显示/隐藏，拖拽移动位置，双击复位；位置和显隐都记在
  * localStorage。脚本只在能拿到 body 的 kimi 页面挂 DOM，其它页面静默。
@@ -62,7 +70,9 @@
     warmupTokens: 8,      // 至少这么多估算 token 才显示速率，之前只显示"已出 N tok"
     idleHideMs: 4000,     // 最后一次增量后多久不再显示实时速率
     finalLingerMs: 60000, // 定稿值停留时间：一次生成的真实结果不该转瞬即逝
-    minFinalStreamMs: 200 // 太短的流不报 TPS（与 TUI 的 MIN_STREAM_MS_FOR_TPS 同义）
+    persistent: true,     // 常驻：不自动隐藏。过了新鲜期仍显示，只是标注"上一轮"
+    minGenMs: 200,        // 生成阶段短于此不报 TPS（与 TUI 的 MIN_STREAM_MS_FOR_TPS 同义）
+    minTurnMs: 1000       // 整轮墙钟短于此不报整轮效率（分母太小会放大噪声）
   };
 
   var LS = {
@@ -116,16 +126,25 @@
       t0: 0,               // 本步开始时刻（增量先到、没见到 step.started 时的兜底基准）
       ttft: null,          // 首次增量 - 提示词提交/本步开始
       firstDeltaAt: null,  // 首帧仅作速率基准，其 token 仍参与整步校准
+      lastDeltaAt: null,   // 末次增量时刻：用来算"首 token → 结束"的生成时长
       calibratable: false, // 仅观察到完整 step 开始时才允许校准
       byKind: {},          // kind -> 原始估算累计，用于结束时校准
-      burst: []            // [{t, tok}] 滚动窗口
+      burst: []            // [{t, tok, firstTok}] 滚动窗口
     };
   }
 
   var stream = null;
-  var lastFinal = null;    // {tps, output, streamMs, ttft, t}
+  var lastFinal = null;    // {tps, output, streamMs, genMs, ttft, t}
+  /// 常驻模式专用：本轮之前是否见过任何一回合。用来区分"新一轮刚起步、新数据
+  /// 还没来"（继续摆上一轮结果/说明在等下一轮）与"从头到尾没有数据"。
+  var sawAnyTurn = false;
+  /// 上一帧渲染的是不是"定稿值"（常驻时靠它决定要不要继续低频重绘，
+  /// 好让"上一轮"标记和悬停标题能按时更新）。
+  var showingFinal = false;
   var lastDeltaAt = 0;
   var promptT0 = null;     // 用户提交提示词的时刻
+  var turnT0 = null;       // 本轮起点：整轮完成效率的分母从这里算
+  var turnTok = 0;         // 本轮各步真实 output 之和（整轮效率的分子）
   var activeSessionId = null;
   var activeTurnId = null;
   var activeStepId = null;
@@ -169,6 +188,10 @@
     currentTurnUsage = null;
     frameKinds = Object.create(null);
     promptT0 = perfNow();
+    turnT0 = promptT0;     // 整轮墙钟从这里起算（含每次调用的首 token 等待与工具执行）
+    turnTok = 0;
+    sawAnyTurn = true;
+    lastDeltaAt = 0;
     scheduleRender();
   }
 
@@ -206,24 +229,34 @@
     var b = (s.byKind[kind] = s.byKind[kind] || { raw: 0, chars: 0 });
     b.raw += raw;
     b.chars += text.length;
-    s.burst.push({ t: now, tok: raw * cal[kind] });
+    // 首个增量只作时间基准：它前面的等待（首个 token 延迟）不属于生成阶段，
+    // 所以它自己的 token 不进实时窗口的分子（与 ZCode 侧胶囊同一口径）。
+    s.burst.push({ t: now, tok: raw * cal[kind], firstTok: s.burst.length === 0 });
+    s.lastDeltaAt = now;
     lastDeltaAt = now;
     if (!display.hidden) scheduleRender();
   }
 
+  /// 实时速率：只统计 (start, now] 区间。
+  /// 首个增量仅作时间基准（它前面是首 token 等待，不属于生成阶段），因此它的
+  /// token 只用于显示、不进分子——分子与分母必须覆盖同一段时间。
   function windowRate() {
     if (!stream) return null;
     var now = perfNow();
     if (stream.firstDeltaAt === null) return null;
     var start = Math.max(stream.firstDeltaAt, now - CFG.windowMs);
     var b = stream.burst;
-    // 统计 (start, now]：首帧之前的时间未知，不把首帧算进分子。
-    // 以 now 结束计时，网络停顿也会让实时速率下降。
-    while (b.length && b[0].t <= start) b.shift();
+    // 区间取 [start, now]：左端点上的样本属于本区间（否则恰好落在边界的那一帧
+    // 会被丢掉，满窗口时分子少一格）。比较时留 1e-6ms 容差，避免浮点误差让
+    // 边界帧时进时出。首帧由 firstTok 标记单独排除。
+    while (b.length && b[0].t < start - 1e-6) b.shift();
     var span = now - start;
     if (span < CFG.minSpanMs) return null;
     var tok = 0;
-    for (var i = 0; i < b.length; i++) tok += b[i].tok;
+    for (var i = 0; i < b.length; i++) {
+      if (b[i].firstTok) continue;   // 首帧只定基准，不做分子
+      tok += b[i].tok;
+    }
     if (tok < CFG.warmupTokens) return null;
     return { tps: tok / (span / 1000), tok: tok, span: span };
   }
@@ -238,6 +271,11 @@
     stream = newStream();
     stream.calibratable = completeStart !== false;
     stream.t0 = promptT0 === null ? perfNow() : promptT0;
+    // 兜底：没观测到 turn.started 时，用首个 step 开始作为整轮墙钟起点
+    if (turnT0 === null || turnT0 === undefined) {
+      turnT0 = perfNow();
+      turnTok = 0;
+    }
     lastFinal = null;
     // 立刻重绘：用户按下回车到首个 token 之间可能等十几秒，这段必须看得见浮层
     if (!display.hidden) {
@@ -258,6 +296,25 @@
     return null;
   }
 
+  /// 本次调用「已累计的生成时间」：实时副行与定稿分母都用它，保证两者同口径。
+  /// 分母原则：不含首 token 等待（首帧到达才开始计时），但**保留同一次生成内部的
+  /// 停顿** —— 没有工具事件就绝不因为"一段时间没收到增量"而扣时（与 ZCode 侧
+  /// 胶囊同一条铁律：未知空档宁可算进去让速率偏低，也不能自动扣掉让速率虚高）。
+  function generationMs(s, timing) {
+    var server = num(timing && timing.llmStreamDurationMs);
+    if (server !== null) return server;              // 服务端权威值（结果里已给出）
+    if (!s || s.firstDeltaAt === null) return null;
+    var last = s.lastDeltaAt !== null ? s.lastDeltaAt : perfNow();
+    return Math.max(0, last - s.firstDeltaAt);
+  }
+
+  /// 把毫秒渲染成"生成时间"用的短格式：<60s 给秒（保留一位有效小数位按 fmtMs 规则），
+  /// 否则给 minNNs/hNNmin。
+  function fmtGen(ms) {
+    if (ms === null || ms === undefined) return null;
+    return ms >= 60000 ? fmtLong(ms) : fmtMs(ms);
+  }
+
   /// 用量对象有两种形态，都要认：
   ///   step.upsert.step.usage            → {inputOther, output, inputCacheRead, …}
   ///   meta.merge.agent.usage.total      → 同上（累计）
@@ -267,6 +324,26 @@
     var v = u.output;
     if (typeof v !== 'number') v = u.output_tokens;
     return num(v) !== null && v > 0 ? v : null;
+  }
+
+  /// 本步的「生成阶段时长」：模型生成速度的分母。
+  /// 分母原则：排除每次调用的首 token 等待，但保留同一次生成内部的停顿。
+  /// 服务端 llmStreamDurationMs 就是流式生成阶段的时长（TUI 也直接拿它当分母
+  /// 算 `output / (llmStreamDurationMs/1000)`），因此**原样采用**，不在这里再减
+  /// TTFT——若该字段本身已不含首 token 等待，再减一次就是重复扣除、会把速率抬高。
+  /// 只有服务端没给这个字段时，才退回「客户端首帧→末帧」的观测跨度。
+  /// 实现见上面的 generationMs()：实时副行与这里用的是同一个函数，口径必然一致。
+
+  /// 当前这一轮的墙钟：从 turn.started（或首个 step 开始）到本回合最后一次活动。
+  /// 关键：回合静置超过 finalLingerMs 后**冻结**在最后一次活动时刻——否则常驻浮层
+  /// 摆在那里，用户去干别的，整轮完成效率会一路衰减成 0.9 tok/s 这种没意义的数。
+  function turnWallMs() {
+    if (turnT0 === null || turnT0 === undefined) return null;
+    var now = perfNow();
+    var end = now;
+    if (lastDeltaAt > 0 && now - lastDeltaAt > CFG.finalLingerMs) end = lastDeltaAt;
+    var ms = end - turnT0;
+    return ms >= CFG.minTurnMs ? ms : null;
   }
 
   function onStepCompleted(step) {
@@ -281,30 +358,39 @@
     var timing = mergeTiming(step && step.timing, step);
     var out = usageOutput(usage);
     var ms = num(timing.llmStreamDurationMs);
+    var s0 = stream;
+    // TTFT 要在 stream 置空之前算：finalTtft 依赖 s.ttft（客户端观测值）
+    var ttft = finalTtft(s0, timing);
+    var genMs = generationMs(s0, timing);
+    // 太短的生成阶段不报 TPS：分母失真（与 TUI 的 MIN_STREAM_MS_FOR_TPS 同义）。
+    // 这种情况下 token 既不算进速率分子，也不算进整轮累计（分子分母同进同出）。
+    var tooShort = genMs === null || genMs < CFG.minGenMs;
+    var calcTps = (!tooShort && out !== null) ? out / (genMs / 1000) : null;
     dbg('step.completed', {
       stepId: step && step.stepId,
       state: step && step.state,
       output: out,
       streamMs: ms,
+      genMs: genMs,
+      clientSpanMs: (s0 && s0.firstDeltaAt !== null && s0.lastDeltaAt !== null)
+        ? s0.lastDeltaAt - s0.firstDeltaAt : null,
+      ttftMs: ttft ? ttft.ms : null,
+      finalTps: calcTps === null ? null : +calcTps.toFixed(2),
       usageKeys: usage && typeof usage === 'object' ? Object.keys(usage) : null,
-      timingKeys: timing && typeof timing === 'object' ? Object.keys(timing) : null,
-      finalTps: (out !== null && ms) ? +(out / (ms / 1000)).toFixed(2) : null
+      timingKeys: timing && typeof timing === 'object' ? Object.keys(timing) : null
     });
     var s = stream;
     stream = null;
     activeStepId = null;
     promptT0 = null;
-    if (out === null || ms === null) return;
+    // 有真实 output 且拿到了可信的生成时长才算"完成"：ms 缺失时优先用
+    // genMs（客户端首帧→末帧）兜底，此前这里直接 return 会把整步丢掉。
+    if (out === null || genMs === null) return;
     if (id !== undefined && id !== null) completedSteps[id] = true;
-    if (ms < CFG.minFinalStreamMs) {
-      // 流太短：按 TUI 的做法不报 TPS（分母失真），只记下本步真实用量
-      lastFinal = { tps: null, output: out, streamMs: ms, ttft: finalTtft(s, timing), t: perfNow() };
-      if (!display.hidden) scheduleRender();
-      return;
-    }
-    // 自校准：拿本步真实 output 与估算总量比，按推理/正文各自占比分摊修正
+    // 自校准：拿本步真实 output 与估算总量比，按推理/正文各自占比分摊修正。
+    // 只让流足够长、真实用量齐全的步参与——短流的真实/估算比噪声太大。
     var total = s ? totalRaw(s) : 0;
-    if (s && s.calibratable && total > 0) {
+    if (s && s.calibratable && !tooShort && total > 0) {
       var ratio = out / total;                 // 本步整体「真实/估算」比
       for (var kind in s.byKind) {
         var b = s.byKind[kind];
@@ -315,15 +401,18 @@
       }
     }
     lastFinal = {
-      tps: out / (ms / 1000),
+      tps: calcTps,
       output: out,
       streamMs: ms,
-      ttft: finalTtft(s, timing),
+      genMs: genMs,
+      ttft: ttft,
       decodeMs: num(timing.llmServerDecodeMs),
       buildMs: num(timing.llmRequestBuildMs),
       firstTokenMs: num(timing.llmServerFirstTokenMs),
       t: perfNow()
     };
+    // 整轮累计：只累真实量到、且生成阶段可测的步（与速率分子同一口径）
+    if (!tooShort) turnTok += out;
     if (!display.hidden) scheduleRender();
   }
 
@@ -638,11 +727,28 @@
   }
 
   // ------------------------------------------------------------------- 渲染
-  var display = { hidden: false, el: null, value: null, sub: null, dot: null };
+  var display = { hidden: false, el: null, value: null, sub: null, dot: null, title: '' };
   try { display.hidden = localStorage.getItem(LS.hidden) === '1'; } catch (e) {}
 
   function fmtTps(v) { return v >= 100 ? String(Math.round(v)) : v.toFixed(1); }
   function fmtMs(v) { return v >= 1000 ? (v / 1000).toFixed(2) + 's' : Math.round(v) + 'ms'; }
+
+  /// 时长：与 ZCode 侧胶囊同一风格（<60s 一位小数；<60min 用 minNNs）
+  function fmtLong(ms) {
+    var s = Math.max(0, ms / 1000);
+    if (s < 60) return s.toFixed(1) + 's';
+    var m = Math.floor(s / 60);
+    if (m < 60) return m + 'min' + String(Math.round(s % 60)).padStart(2, '0') + 's';
+    return Math.floor(m / 60) + 'h' + String(m % 60).padStart(2, '0') + 'min';
+  }
+
+  /// 用量：与 ZCode 侧胶囊同一风格（≥1000 折叠成 1.4k）
+  function fmtTok(v) {
+    var n = Math.round(v || 0);
+    if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
+    if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
+    return String(n);
+  }
 
   function ensureEl() {
     if (display.el && display.el.isConnected) return display.el;
@@ -759,47 +865,56 @@
     var sub = '';
     var color = '#3d6bff';
     var pulse = false;
+    // 常驻模式下，过了新鲜期要给副行加"上一轮"；这个标记只在重绘时才有机会更新，
+    // 所以下面要保证常驻时始终有低频重绘（否则标记永远不出现）。
+    var stale = !!(CFG.persistent && lastFinal && now - lastFinal.t > CFG.finalLingerMs);
+    showingFinal = false;
 
     // 优先级：实时速率 > 定稿值 > 生成中（含"已出 N tok"）。定稿值只在没有
     // 新的流时才盖住"生成中"，否则连续多步会把刚出的数字顶掉。
     if (live && now - lastDeltaAt < CFG.idleHideMs) {
       text = '≈ ' + fmtTps(live.tps) + ' tok/s';
-      sub = '实时估算 · ' + Math.round(live.tok) + ' tok';
-      if (stream && stream.ttft !== null) sub += ' · 首 token ' + fmtMs(stream.ttft);
+      // 副行给"已累计生成时间"：与定稿分母同口径（首帧起算，保留段内停顿）
+      var liveGenMs = generationMs(stream, null);
+      if (liveGenMs !== null) sub = '生成 ' + fmtGen(liveGenMs);
       pulse = true;
-    } else if (lastFinal && now - lastFinal.t < CFG.finalLingerMs && !stream) {
-      if (lastFinal.tps === null) {
-        // 流太短不报速率，但把真实用量亮出来
-        text = lastFinal.output + ' tok';
-        sub = '流太短(' + fmtMs(lastFinal.streamMs) + ')，不报 TPS';
-      } else {
-        text = fmtTps(lastFinal.tps) + ' tok/s';
-        sub = lastFinal.output + ' tok / ' + fmtMs(lastFinal.streamMs);
-        if (lastFinal.ttft) sub += ' · TTFT ' + fmtMs(lastFinal.ttft.ms) + '(' + lastFinal.ttft.src + ')';
-        if (lastFinal.decodeMs) sub += ' · 服务端解码 ' + fmtMs(lastFinal.decodeMs);
-      }
+    } else if (lastFinal && (CFG.persistent || now - lastFinal.t < CFG.finalLingerMs)) {
+      // 常驻模式下不再按时间隐藏：新数据来了就更新，没有就一直摆着上一轮结果，
+      // 过了 finalLingerMs 就在副行标注"上一轮"。
+      // 副行只给三项：整轮输出、生成时间、TTFT —— 与 ZCode 侧胶囊同一版面。
+      var parts = [];
+      if (lastFinal.output != null) parts.push('整轮输出 ' + fmtTok(lastFinal.output) + ' tok');
+      var finGenMs = lastFinal.decodeMs || lastFinal.genMs;
+      if (finGenMs) parts.push('生成 ' + fmtGen(finGenMs));
+      if (lastFinal.ttft && lastFinal.ttft.ms != null) parts.push('TTFT ' + fmtMs(lastFinal.ttft.ms));
+      if (stale) parts.push('上一轮');
+      sub = parts.join(' · ');
+      text = lastFinal.tps === null
+        ? fmtTok(lastFinal.output || 0) + ' tok'
+        : fmtTps(lastFinal.tps) + ' tok/s';
       color = '#4ad07a';
+      showingFinal = true;
     } else if (stream) {
       // 生成中：TTFT 可能十几秒，这段等待期也必须看得见浮层
-      var outSoFar = usageOutput(currentTurnUsage);
       // 注意：t0 可能是 0（页面刚加载时 performance.now() 就是 0），不能用 `||`
       // 兜底，否则 0 会被当成"没值"，等待时长恒为 0。
       var waited = stream.ttft !== null ? stream.ttft
         : now - (stream.t0 !== null && stream.t0 !== undefined ? stream.t0 : now);
       text = live ? '≈ ' + fmtTps(live.tps) + ' tok/s' : '生成中…';
-      sub = '首 token ' + fmtMs(waited);
+      var midGenMs = generationMs(stream, null);
+      sub = midGenMs === null ? '等待首 token ' + fmtMs(waited) : '生成 ' + fmtGen(midGenMs);
       if (DEBUG && dbgTrace.length < 40) {
         dbgTrace.push({ now: now, t0: stream.t0, ttft: stream.ttft, waited: waited, sub: sub });
       }
-      if (outSoFar) sub += ' · 本轮已出 ' + outSoFar + ' tok';
       // 只有速率在活（真有增量）时才做脉冲动画；纯等待交给 watchdog 每秒刷新，
       // 否则会一直自调度空转刷帧。
       if (live) pulse = true;
       else watchdog(250);
-    } else if (force) {
-      // 强制显示（排障用）：没有数据也把胶囊亮出来，证明脚本确实挂上了
+    } else if (force || CFG.persistent) {
+      // 常驻：没有任何数据时也把浮层摆在那里——排障时一眼能看出脚本确实挂上了。
+      // 新一轮刚起步（之前见过回合）时继续说明在等下一轮，而不是谎称"等待生成"。
       text = 'TPS 就绪';
-      sub = '等待生成 · Ctrl+Alt+T 隐藏';
+      sub = sawAnyTurn ? '暂无生成 · 等待下一轮' : '等待生成 · Ctrl+Alt+T 隐藏';
       color = '#9aa1ad';
     } else {
       box.style.display = 'none';
@@ -809,15 +924,22 @@
     box.style.display = 'inline-flex';
     display.value.textContent = text;
     display.sub.textContent = sub;
+    // 悬停提示按需求取消（与 ZCode 侧胶囊一致）：标题恒为空，鼠标移上去不弹框。
+    if (typeof box.setAttribute === 'function') box.setAttribute('title', '');
+    else box.title = '';
+    display.title = '';
     display.dot.style.background = color;
     display.dot.style.opacity = pulse ? String(0.45 + 0.55 * Math.abs(Math.sin(now / 420))) : '1';
 
-    // 脉冲动画只在真有增量流动时自调度；流卡住（比如等 TTFT 十几秒）时
-    // 由 watchdog 定时唤醒，避免空转刷帧。
-    if (pulse) {
-      // 只有真有增量在流动时才逐帧自调度（脉冲动画）；等 TTFT 时交给 watchdog
-      if (now - lastDeltaAt < CFG.idleHideMs) scheduleRender();
-      else watchdog(1000);
+    // 刷新策略：有速率在跳时逐帧重绘（脉冲动画）；其余情况一律用 watchdog
+    // 低频唤醒即可。常驻模式下这条很关键——既不能 250ms 一次空转重绘，
+    // 也不能完全停下（那样"上一轮"标记和悬停标题就再也不会更新）。
+    if (pulse && now - lastDeltaAt < CFG.idleHideMs) {
+      scheduleRender();
+    } else if (pulse) {
+      watchdog(1000);
+    } else if (CFG.persistent) {
+      watchdog(showingFinal ? 1500 : 1000);
     }
   }
 
@@ -860,7 +982,15 @@
     /// snapshot() 返回浮层的实际几何与文本，供外部核对是否真的可见
     snapshot: snapshot,
     state: function () {
-      return { stream: stream, final: lastFinal, window: windowRate() };
+      return {
+        stream: stream,
+        final: lastFinal,
+        window: windowRate(),
+        // 本轮用量（原来只体现在副行的"本轮已出"上，副行改版后供测试与排障直接读）
+        currentTurnUsage: currentTurnUsage,
+        // 整轮口径：turnTok 是整轮真实 output 累计，wallMs 是整轮墙钟
+        turn: { t0: turnT0, tok: turnTok, wallMs: turnWallMs() }
+      };
     }
   };
 
@@ -878,6 +1008,7 @@
       zIndex: cs.zIndex,
       text: display.value ? display.value.textContent : null,
       sub: display.sub ? display.sub.textContent : null,
+      title: display.title || null,
       rect: { l: Math.round(r.left), t: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height) },
       inViewport: r.width > 0 && r.height > 0 && r.top < window.innerHeight && r.left < window.innerWidth
     };
